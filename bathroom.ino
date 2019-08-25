@@ -1,6 +1,9 @@
 #include <ESP8266WiFi.h>
 #include "Adafruit_MQTT.h"
 #include "Adafruit_MQTT_Client.h"
+#include "DHTesp.h"
+DHTesp dht;
+
 
 #ifndef STASSID
 #define STASSID "freekitties"
@@ -10,9 +13,12 @@
 const char* ssid     = STASSID;
 const char* password = STAPSK;
 
-#define VERSION_MESSAGE F("Bathroom Console v0.10 18/04/19")
+#define VERSION_MESSAGE F("Bathroom Console v0.11 24/08/19")
 
 #define LEAK_PIN A0
+#define MOTION_SENSOR_PIN D8
+#define DHT_SENSOR_PIN D2
+#define BUTTON0_PIN D3
 
 #define AIO_SERVER      "192.168.2.20"
 #define AIO_SERVERPORT  1883
@@ -21,8 +27,9 @@ const char* password = STAPSK;
 #define WILL_FEED AIO_USERNAME "/feeds/nodes.bathroom"
 #define SERVER_LISTEN_PORT 80
 #define MQTT_CONNECT_RETRY_MAX 5
-#define MQTT_PING_INTERVAL_MS 60000
-#define SENSOR_READ_INTERVAL_MS 5000
+#define MQTT_PING_INTERVAL_MS 10000
+#define LEAK_SENSOR_READ_INTERVAL_MS 5000
+#define DHT_SENSOR_READ_INTERVAL_MS 30000
 
 byte mac[] = {0xBE, 0xBD, 0xFA, 0xAB, 0xCD, 0xEF};
 //IPAddress iotIP (192, 168, 0, 103);
@@ -33,7 +40,7 @@ uint32_t now = 0; // timestamp
 uint32_t nextConnectionAttempt = 0; // timestamp
 uint32_t failedConnectionAttempts = 0;
 uint32_t lastSensorRead = 0;
-
+uint32_t lastDhtSensorRead = 0;
 int lastState[20] = {0};
 
 
@@ -46,6 +53,10 @@ WiFiClient client;
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
 Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
 Adafruit_MQTT_Publish leak = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/leak.bathroom");
+Adafruit_MQTT_Publish motion = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/bathroom.motion");
+Adafruit_MQTT_Publish temp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/bathroom.temperature");
+Adafruit_MQTT_Publish humid = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/bathroom.humidity");
+Adafruit_MQTT_Publish button0 = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/bathroom.button0");
 
 Adafruit_MQTT_Subscribe bathroomlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.bathroomlight");
 //Adafruit_MQTT_Subscribe shedlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.shedlight");
@@ -93,8 +104,49 @@ void setup() {
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
 
+  mqtt.will(WILL_FEED, "0");
+
+   pinMode(MOTION_SENSOR_PIN, INPUT);
+   pinMode(BUTTON0_PIN, INPUT_PULLUP);
+   dht.setup(DHT_SENSOR_PIN, DHTesp::DHT22);
+
   lastSensor = analogRead(LEAK_PIN);
+  lastSensorRead = millis();
 }
+
+void readLeakSensor(bool force = false) {
+  //Serial.println(now - lastSensorRead);
+  if (force || now - lastSensorRead > LEAK_SENSOR_READ_INTERVAL_MS) {
+    int sensor = analogRead(LEAK_PIN);
+    bool sensorChanged = abs(lastSensor - sensor) > 100;
+
+    lastSensorRead = now;
+
+    if (sensorChanged || force) {
+      Serial.println("Publishing Leak Sensor Value");
+      leak.publish(sensor);
+    }
+  }
+}
+
+void readDht() {
+  if (now - lastDhtSensorRead > DHT_SENSOR_READ_INTERVAL_MS) {
+    float h = dht.getHumidity();
+    float t = dht.getTemperature();
+    temp.publish(t);
+    humid.publish(h);
+
+
+    Serial.print("{\"humidity\": ");
+    Serial.print(h);
+    Serial.print(", \"temp\": ");
+    Serial.print(t);
+    Serial.print("}\n");
+
+    lastDhtSensorRead = now;
+  }
+}
+
 
 // the loop function runs over and over again forever
 void loop() {
@@ -103,62 +155,52 @@ void loop() {
   MQTT_connect();
 
   // this is our 'wait for incoming subscription packets' busy subloop
-  Adafruit_MQTT_Subscribe *subscription;
-  while ((subscription = mqtt.readSubscription(1000))) {
-    if (subscription == &bathroomlight) {
-      Serial.print(F("Got: "));
-      Serial.println((char *)bathroomlight.lastread);
-    }
-  }
+  mqtt.process(100);
 
-  /*
-  // Now we can publish stuff!
-  Serial.print(F("\nSending photocell val "));
-  Serial.print(x);
-  Serial.print("...");
-  if (! photocell.publish(x++)) {
-    Serial.println(F("Failed"));
-  } else {
-    Serial.println(F("OK!"));
-  }*/
+  detectEdge(MOTION_SENSOR_PIN, &motion);
+  detectEdge(BUTTON0_PIN, &button0);
 
+  MQTT_ping();
+
+  readLeakSensor();
+  readDht();
   
-
-  bool pinged = MQTT_ping();
-
-  if (lastSensorRead + SENSOR_READ_INTERVAL_MS < now) {
-    int sensor = analogRead(LEAK_PIN);
-    bool sensorChanged = abs(lastSensor - sensor) > 100;
-
-    lastSensorRead = now;
-
-    if (pinged || sensorChanged) {
-      leak.publish(sensor);
-    }
-  }
-  
-  delay(1000);
+  delay(100);
 }
 
-bool MQTT_ping() {
-
-  if (!mqtt.connected()) {
-    return false;
-  }
-
-  if (lastPing + MQTT_PING_INTERVAL_MS < now) {
-    Serial.println(F("Ping"));
-    lastPing = now;
-    if (!mqtt.ping()) {
-      Serial.println(F("Failed to ping"));
-      mqtt.disconnect();
+void detectEdge(int pin, Adafruit_MQTT_Publish* feed) {
+  int state = digitalRead(pin);
+  if (state != lastState[pin]) {
+    Serial.print("Publishing state change on pin ");
+    Serial.print(pin);
+    if (state == HIGH) {
+      Serial.println(" high");
+      feed->publish("1");
     } else {
-      lastwill.publish(now);
-      return true;
+      Serial.println(" low");
+      feed->publish("0");
     }
   }
 
-  return false;
+  lastState[pin] = state;
+}
+
+void onPing(bool result) {
+
+  readLeakSensor(true);
+  lastwill.publish(now);
+}
+
+void MQTT_ping() {
+  if (!mqtt.connected()) {
+    return;
+  }
+
+  if (now - lastPing > MQTT_PING_INTERVAL_MS) {
+    Serial.println(F("Ping"));
+    lastPing = now;
+    mqtt.pingAsync(&onPing);
+  }
 }
 
 void MQTT_connect() {
