@@ -1,19 +1,14 @@
 #include <ESP8266WiFi.h>
-#include "Adafruit_MQTT.h"
-#include "Adafruit_MQTT_Client.h"
-#include "DHTesp.h"
-DHTesp dht;
-
+#include <Adafruit_MQTT.h>
+#include <Adafruit_MQTT_Client.h>
+#include <DHTesp.h>
 
 #ifndef STASSID
 #define STASSID "freekitties"
 #define STAPSK  "kalogataki"
 #endif
 
-const char* ssid     = STASSID;
-const char* password = STAPSK;
-
-#define VERSION_MESSAGE F("Bathroom Console v0.11 24/08/19")
+#define VERSION_MESSAGE F("Bathroom Console v0.12 28/08/19")
 
 #define LEAK_PIN A0
 #define MOTION_SENSOR_PIN D8
@@ -31,8 +26,10 @@ const char* password = STAPSK;
 #define LEAK_SENSOR_READ_INTERVAL_MS 5000
 #define DHT_SENSOR_READ_INTERVAL_MS 30000
 
+const char* ssid     = STASSID;
+const char* password = STAPSK;
+
 byte mac[] = {0xBE, 0xBD, 0xFA, 0xAB, 0xCD, 0xEF};
-//IPAddress iotIP (192, 168, 0, 103);
 
 uint32_t lastPing = 0; // timestamp
 uint32_t connectedSince = 0; // timestamp
@@ -42,13 +39,12 @@ uint32_t failedConnectionAttempts = 0;
 uint32_t lastSensorRead = 0;
 uint32_t lastDhtSensorRead = 0;
 int lastState[20] = {0};
+int lastSensor;
 
+DHTesp dht;
 
 WiFiServer server(SERVER_LISTEN_PORT);
-// Create an ESP8266 WiFiClient class to connect to the MQTT server.
 WiFiClient client;
-// or... use WiFiFlientSecure for SSL
-//WiFiClientSecure client;
 
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
 Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
@@ -59,9 +55,6 @@ Adafruit_MQTT_Publish humid = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/
 Adafruit_MQTT_Publish button0 = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/bathroom.button0");
 
 Adafruit_MQTT_Subscribe bathroomlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.bathroomlight");
-//Adafruit_MQTT_Subscribe shedlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.shedlight");
-
-/*************************** Sketch Code ************************************/
 
 #define halt(s) { Serial.println(F( s )); while(1);  }
 
@@ -75,8 +68,6 @@ void resetFunc(const __FlashStringHelper* msg, unsigned long delayMs) {
   delay(delayMs);
   __resetFunc();
 }
-
-int lastSensor;
 
 void setup() {
   Serial.begin(115200);
@@ -106,9 +97,9 @@ void setup() {
 
   mqtt.will(WILL_FEED, "0");
 
-   pinMode(MOTION_SENSOR_PIN, INPUT);
-   pinMode(BUTTON0_PIN, INPUT_PULLUP);
-   dht.setup(DHT_SENSOR_PIN, DHTesp::DHT22);
+  pinMode(MOTION_SENSOR_PIN, INPUT);
+  pinMode(BUTTON0_PIN, INPUT_PULLUP);
+  dht.setup(DHT_SENSOR_PIN, DHTesp::DHT22);
 
   lastSensor = analogRead(LEAK_PIN);
   lastSensorRead = millis();
@@ -148,19 +139,17 @@ void readDht() {
 }
 
 
-// the loop function runs over and over again forever
 void loop() {
   now = millis();
   //Ethernet.maintain();
-  MQTT_connect();
+  connectMqtt();
 
-  // this is our 'wait for incoming subscription packets' busy subloop
   mqtt.process(100);
 
   detectEdge(MOTION_SENSOR_PIN, &motion);
   detectEdge(BUTTON0_PIN, &button0);
 
-  MQTT_ping();
+  pingMqtt();
 
   readLeakSensor();
   readDht();
@@ -191,7 +180,7 @@ void onPing(bool result) {
   lastwill.publish(now);
 }
 
-void MQTT_ping() {
+void pingMqtt() {
   if (!mqtt.connected()) {
     return;
   }
@@ -203,7 +192,7 @@ void MQTT_ping() {
   }
 }
 
-void MQTT_connect() {
+void connectMqtt() {
   int8_t ret;
 
   // Stop if already connected.
